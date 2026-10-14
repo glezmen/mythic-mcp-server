@@ -15,6 +15,15 @@ At the beginning of a new campaign, invent a fresh, coherent world, setting, gen
 The Player agent decides what character they want to play and may accept, refine, or reject the proposed concept or ask for alternatives. Never dictate the player's character choices.
 Keep the story open-ended and reactive. Present what the character can perceive and let the Player agent decide what to do. Never decide the character's actions, thoughts, or feelings.
 Use the Mythic MCP server as the authoritative rules and campaign-state engine. Discover its available tools and schemas at runtime. Use its Fate Question, Random Event, scene, Chaos Factor, and state tools when appropriate. Do not invent tool names or arguments, and do not replace MCP mechanics with locally hardcoded tables or dice rules.
+
+MYTHIC PACING AND FAIRNESS:
+- Do NOT make a Fate Question for every player action. Use one only when an outcome is genuinely uncertain, consequential, and cannot be settled reasonably from established facts and the fiction. Routine movement, observation, conversation, and obvious consequences usually do not need a roll.
+- Never bundle multiple independent outcomes into one Fate Question. Ask one short, unambiguous yes/no question at a time. Do not combine alternatives with "or" or pack several risks into one question.
+- Do not call a tool merely to make the scene feel mechanical. Prefer direct, fiction-first adjudication when the outcome is obvious or low-stakes. Use state tools when a durable campaign fact/thread/character/scene state genuinely needs recording.
+- Respect the exact result returned by Mythic MCP. A failed or exceptional result is not permission to pile on unrelated penalties. Usually introduce one proportionate consequence, then preserve meaningful choices and forward momentum. Escalate further only when supported by the result and established circumstances.
+- Keep consequences consistent with what the character attempted and what is established. Do not invent several additional injuries, equipment failures, hostile responses, and environmental disasters from a single failure unless the fiction clearly supports them.
+- Vary prose and scene endings. Avoid stock phrases and repeated closers; do not repeatedly end with the same sentence or formulaic invitation. End naturally on a concrete change, detail, question, or decision point suited to this scene.
+- Keep narration focused and avoid repeating established facts. Leave the player character's actions, thoughts, and feelings to the Player agent.
 """
 PLAYER_SYSTEM = """You are the Player agent in a Mythic roleplaying session.
 When a new campaign begins, respond to the GM's proposed world and character concept. Decide what sort of character you want to play; you may accept, refine, or reject the proposal and request alternatives. Do not assume a setting or character was selected in advance.
@@ -42,6 +51,47 @@ def log_dialogue(path, role, text, turn=None):
         f.write(json.dumps(entry, ensure_ascii=False) + "\n")
 
 
+def last_logged_turn(path):
+    """Return the largest dialogue turn number already present in a JSONL log."""
+    if not path or not Path(path).exists():
+        return 0
+    largest = 0
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            for line in f:
+                try:
+                    entry = json.loads(line)
+                except (json.JSONDecodeError, TypeError):
+                    continue
+                if entry.get("role") in ("Player", "GM"):
+                    try:
+                        largest = max(largest, int(entry.get("turn") or 0))
+                    except (TypeError, ValueError):
+                        pass
+    except OSError:
+        pass
+    return largest
+
+
+def last_dialogue_entry(path):
+    """Return the last valid GM/Player entry from a dialogue JSONL log."""
+    if not path or not Path(path).exists():
+        return None
+    last = None
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            for line in f:
+                try:
+                    entry = json.loads(line)
+                except (json.JSONDecodeError, TypeError):
+                    continue
+                if entry.get("role") in ("GM", "Player"):
+                    last = entry
+    except OSError:
+        return None
+    return last
+
+
 def new_state():
     """Empty bootstrap. The GM and Player agents establish the campaign from scratch."""
     return {
@@ -61,14 +111,101 @@ def new_state():
 
 
 class Client:
-    def __init__(self,url,model,temperature,max_tokens,timeout):
-        self.url=url.rstrip("/"); self.model=model; self.temperature=temperature
-        self.max_tokens=max_tokens; self.timeout=timeout
-    def chat(self,messages):
-        r=requests.post(self.url+"/chat/completions",json={"model":self.model,"messages":messages,
-          "temperature":self.temperature,"max_tokens":self.max_tokens,"stream":False},timeout=self.timeout)
-        if not r.ok: raise RuntimeError(f"LM Studio HTTP {r.status_code}: {r.text[:1000]}")
-        return str(r.json()["choices"][0]["message"].get("content") or "").strip()
+    def __init__(self, url, model, temperature, max_tokens, timeout, reasoning=None):
+        self.url = url.rstrip("/")
+        self.model = model
+        self.temperature = temperature
+        self.max_tokens = max_tokens
+        self.timeout = timeout
+        self.reasoning = reasoning
+
+    @staticmethod
+    def _extract_text(content):
+        if isinstance(content, str):
+            return content.strip()
+        if isinstance(content, list):
+            parts = []
+            for item in content:
+                if isinstance(item, str):
+                    parts.append(item)
+                elif isinstance(item, dict) and isinstance(item.get("text"), str):
+                    parts.append(item["text"])
+            return "\n".join(parts).strip()
+        return ""
+
+    def chat(self, messages):
+        # max_tokens is an output budget, not a target length. If the model
+        # exhausts it while reasoning, retry with a larger budget rather than
+        # silently treating the empty content field as a valid turn.
+        last_detail = "No response received"
+        for attempt in range(1, 4):
+            request_messages = list(messages)
+            attempt_max_tokens = self.max_tokens * (2 ** (attempt - 1))
+            if attempt > 1:
+                request_messages.append({
+                    "role": "user",
+                    "content": (
+                        "Your previous generation did not produce a visible answer. "
+                        "Now provide the requested final response directly in the normal "
+                        "assistant answer. Do not output a planning trace or an empty answer."
+                    ),
+                })
+                print(
+                    f"[LM Studio] Retrying with max_tokens={attempt_max_tokens} "
+                    f"(attempt {attempt}/3).", flush=True,
+                )
+
+            request_payload = {
+                "model": self.model,
+                "messages": request_messages,
+                "temperature": self.temperature,
+                "max_tokens": attempt_max_tokens,
+                "stream": False,
+            }
+            # LM Studio's OpenAI-compatible endpoint supports reasoning_effort
+            # for compatible reasoning models. Pass the user-provided value as-is.
+            if self.reasoning is not None:
+                request_payload["reasoning_effort"] = self.reasoning
+
+            r = requests.post(
+                self.url + "/chat/completions",
+                json=request_payload,
+                timeout=self.timeout,
+            )
+            if not r.ok:
+                raise RuntimeError(f"LM Studio HTTP {r.status_code}: {r.text[:1500]}")
+            payload = r.json()
+            choices = payload.get("choices") or []
+            if choices:
+                choice = choices[0]
+                message = choice.get("message") or {}
+                text = self._extract_text(message.get("content"))
+                if text:
+                    return text
+                reasoning_text = self._extract_text(
+                    message.get("reasoning_content", message.get("reasoning"))
+                )
+                usage = payload.get("usage") or {}
+                last_detail = (
+                    f"empty content (finish_reason={choice.get('finish_reason')!r}, "
+                    f"reasoning_chars={len(reasoning_text)}, usage={json.dumps(usage, ensure_ascii=False)})"
+                )
+                print(
+                    f"[LM Studio] No visible content on attempt {attempt}/3: {last_detail}",
+                    file=sys.stderr, flush=True,
+                )
+                # Do not present internal reasoning as the GM/Player's final
+                # turn. Keep it available for diagnostics, and ask for a visible
+                # final answer with a larger output budget on the next attempt.
+            else:
+                last_detail = f"response has no choices: {json.dumps(payload, ensure_ascii=False)[:1200]}"
+                print(f"[LM Studio] Unusable response on attempt {attempt}/3: {last_detail}", file=sys.stderr, flush=True)
+            time.sleep(0.5)
+
+        raise RuntimeError(
+            f"LM Studio did not return visible content after 3 attempts for model {self.model}. "
+            f"Last response details: {last_detail}"
+        )
 
 def call(client, role, history, prompt):
     system=GM_SYSTEM if role=="GM" else PLAYER_SYSTEM
@@ -222,8 +359,11 @@ def choose_tool_call(client, history, tools_text, action_text):
 
     raw = client.chat([
         {"role": "system", "content": (
-            "You are a strict MCP tool selector. Return valid JSON only, "
-            "with no Markdown or additional text."
+            "You are a conservative Mythic MCP tool selector. Return valid JSON only, "
+            "with no Markdown or additional text. Avoid unnecessary mechanics: most "
+            "ordinary actions do not need Fate Questions. Use one only for a genuinely "
+            "uncertain, consequential yes/no outcome. Never combine separate outcomes. "
+            "Prefer {\"call_tool\": false} when a tool is not clearly needed."
         )},
         {"role": "user", "content": prompt},
     ])
@@ -275,7 +415,8 @@ def main():
         help="Enter player actions yourself instead of using the Player agent.",
     )
     parser.add_argument("--temperature", type=float, default=0.7)
-    parser.add_argument("--max-tokens", type=int, default=1800)
+    parser.add_argument("--max-tokens", type=int, default=8192, help="Initial output token budget; if the model exhausts it without visible content, retries double the budget.")
+    parser.add_argument("--reasoning", default=None, help="Reasoning effort/value passed to LM Studio as reasoning_effort (for example: none, low, medium, high; other values are passed through).")
     parser.add_argument("--timeout", type=int, default=600)
     parser.add_argument("--max-turns", type=int, default=0, help="Stop after this many self-play turns; 0 means unlimited.")
     parser.add_argument(
@@ -311,6 +452,7 @@ def main():
         args.temperature,
         args.max_tokens,
         args.timeout,
+        args.reasoning,
     )
 
     bridge = None
@@ -414,11 +556,31 @@ def main():
                     arguments = selection.get("arguments", {})
                     print(f"[MCP] Calling {name} with {json.dumps(arguments, ensure_ascii=False)}", flush=True)
                     result = bridge.call(name, arguments)
+                    # If the local campaign is fresh but the MCP server still has an
+                    # old session, reset that stale session and retry initialization.
+                    result_text = json.dumps(result, ensure_ascii=False).lower()
+                    local_campaign_is_fresh = bool(args.new or not state_path.exists() or not state.get("last_gm"))
+                    if (name == "start_session" and local_campaign_is_fresh
+                            and "active session already exists" in result_text):
+                        print("[MCP] A stale active session exists; resetting it before starting the new campaign.", flush=True)
+                        reset_result = bridge.call("reset_session", {})
+                        log(log_path, {"role": "MCP", "tool": "reset_session", "arguments": {},
+                                       "purpose": "Clear stale MCP session before initializing a fresh local campaign.",
+                                       "result": reset_result})
+                        result = bridge.call(name, arguments)
+                        result_text = json.dumps(result, ensure_ascii=False).lower()
+                        if "active session already exists" in result_text:
+                            raise RuntimeError("MCP still reports an active session after reset_session.")
                     print(f"[MCP] {name} completed.", flush=True)
                     log(log_path, {
                         "role": "MCP", "tool": name, "arguments": arguments,
                         "purpose": selection.get("purpose", ""), "result": result,
                     })
+                    result_serialized = json.dumps(result, ensure_ascii=False).lower()
+                    if isinstance(result, dict) and result.get("isError"):
+                        raise RuntimeError(f"MCP tool {name} returned isError=true: {result}")
+                    if '"error"' in result_serialized and name == "start_session":
+                        raise RuntimeError(f"MCP session initialization failed: {result}")
                     follow_up = (
                         "An authoritative Mythic MCP tool has returned this result. "
                         "Treat the result as authoritative; do not change or reroll it. "
@@ -471,27 +633,56 @@ def main():
             log_dialogue(args.conversation_log, "GM", gm_text, turn=0)
             save(state_path, state)
 
-        turn_count = 0
+        # Continue numbering from the existing dialogue log when resuming a run.
+        # The conversation log is append-only, while the loop counter is process-local.
+        logged_turn = max(
+            last_logged_turn(args.conversation_log),
+            last_logged_turn(log_path),
+        )
+        saved_turn = int(state.get("turn_count", 0) or 0)
+        turn_count = max(logged_turn, saved_turn)
+        pending_entry = last_dialogue_entry(args.conversation_log)
+        pending_player_action = None
+        resuming_pending_action = False
+        if (pending_entry and pending_entry.get("role") == "Player"
+                and int(pending_entry.get("turn") or 0) == turn_count):
+            # If the previous process stopped after logging the Player action but before
+            # the GM reply, finish that turn instead of generating a duplicate action.
+            pending_player_action = str(pending_entry.get("text") or "")
+            resuming_pending_action = bool(pending_player_action)
+        if turn_count:
+            if pending_player_action:
+                print(f"Resuming interrupted turn {turn_count} with its saved Player action.", flush=True)
+            else:
+                print(f"Resuming turn numbering from {turn_count}; next turn is {turn_count + 1}.", flush=True)
         print("Autonomous self-play enabled. Press Ctrl+C to stop.")
 
-        while args.max_turns <= 0 or turn_count < args.max_turns:
-            turn_count += 1
+        completed_this_run = 0
+        while args.max_turns <= 0 or completed_this_run < args.max_turns:
+            resumed_action_this_turn = pending_player_action is not None
+            if resumed_action_this_turn:
+                player_action = pending_player_action
+                pending_player_action = None
+            else:
+                turn_count += 1
+                player_prompt = (
+                    "Continue the autonomous roleplaying session. Based on the GM's latest "
+                    "narration, independently decide what your character does next. If the "
+                    "character concept has not yet been settled, accept, refine, or reject "
+                    "the proposal and then choose an action. Do not decide uncertain outcomes; "
+                    "state only the character's intended action. Do not ask the human for input. "
+                    "Keep the action appropriate to the character's goals, knowledge, and the "
+                    "current situation.\n\nGM narration:\n"
+                    + state.get("last_gm", "")
+                )
 
-            player_prompt = (
-                "Continue the autonomous roleplaying session. Based on the GM's latest "
-                "narration, independently decide what your character does next. If the "
-                "character concept has not yet been settled, accept, refine, or reject "
-                "the proposal and then choose an action. Do not decide uncertain outcomes; "
-                "state only the character's intended action. Do not ask the human for input. "
-                "Keep the action appropriate to the character's goals, knowledge, and the "
-                "current situation.\n\nGM narration:\n"
-                + state.get("last_gm", "")
-            )
-
-            player_action = call(client, "Player", player_history, player_prompt)
-            print(f"\n=== Player (turn {turn_count}) ===\n{player_action}", flush=True)
-            log(log_path, {"role": "Player", "turn": turn_count, "text": player_action})
-            log_dialogue(args.conversation_log, "Player", player_action, turn=turn_count)
+                player_action = call(client, "Player", player_history, player_prompt)
+            if not resumed_action_this_turn:
+                print(f"\n=== Player (turn {turn_count}) ===\n{player_action}", flush=True)
+                log(log_path, {"role": "Player", "turn": turn_count, "text": player_action})
+                log_dialogue(args.conversation_log, "Player", player_action, turn=turn_count)
+            else:
+                print(f"\n=== Resuming Player action (turn {turn_count}) ===\n{player_action}", flush=True)
 
             gm_prompt = (
                 "Continue the autonomous roleplaying session in the language already "
@@ -499,8 +690,15 @@ def main():
                 "follows from the fiction and authoritative Mythic MCP results, and then "
                 "leave a clear situation for the Player agent's next decision. Do not "
                 "invent a result for a mechanic that should be resolved by Mythic MCP. "
-                "If a Fate Question is needed, mark it exactly as [FATE: question | odds] "
-                "and do not decide its outcome. Never emit tool-call markup. Do not ask "
+                "Only use a Fate Question for a genuinely uncertain, consequential outcome; "
+                "do not roll for every action, routine movement, observation, or dialogue. "
+                "If needed, mark exactly one short yes/no question as [FATE: question | odds]. "
+                "Never combine multiple outcomes or use 'or' to bundle alternatives into one "
+                "question. Do not decide a Fate outcome yourself. For obvious or low-stakes "
+                "results, adjudicate directly from the fiction. A setback should normally have "
+                "one proportionate consequence, not a stack of unrelated punishments; preserve "
+                "meaningful next choices. Vary prose and avoid repeating stock closing lines. "
+                "Never emit tool-call markup. Do not ask "
                 "the human for input; this is autonomous agent-vs-agent play.\n\n"
                 "Previous GM narration:\n"
                 + state.get("last_gm", "")
@@ -523,7 +721,9 @@ def main():
 
             state["last_gm"] = gm_text
             state["scene_number"] = int(state.get("scene_number", 0)) + 1
+            state["turn_count"] = turn_count
             save(state_path, state)
+            completed_this_run += 1
 
         if args.max_turns > 0:
             print(f"Reached --max-turns={args.max_turns}; stopping self-play.")
