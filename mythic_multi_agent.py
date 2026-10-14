@@ -27,6 +27,21 @@ def save(path, state):
 def log(path, data):
     with open(path,"a",encoding="utf-8") as f:
         f.write(json.dumps({"time":time.strftime("%Y-%m-%dT%H:%M:%S%z"),**data},ensure_ascii=False)+"\n")
+def log_dialogue(path, role, text, turn=None):
+    """Append only player-facing GM/Player dialogue to a separate file."""
+    if not path:
+        return
+    entry = {
+        "time": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+        "role": role,
+        "text": text,
+    }
+    if turn is not None:
+        entry["turn"] = turn
+    with open(path, "a", encoding="utf-8") as f:
+        f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+
+
 def new_state():
     """Empty bootstrap. The GM and Player agents establish the campaign from scratch."""
     return {
@@ -152,7 +167,7 @@ class MythicMCPBridge:
 
 
 def mcp_tool_catalog(bridge):
-    return "\\n".join(
+    return "\n".join(
         f"- {t['name']}: {t['description']} | inputSchema={json.dumps(t['inputSchema'], ensure_ascii=False)}"
         for t in bridge.tools
     )
@@ -218,6 +233,12 @@ def main():
     parser.add_argument("--model", default=os.getenv("LM_STUDIO_MODEL", DEFAULT_MODEL))
     parser.add_argument("--state", default="game_state.json")
     parser.add_argument("--log", default="game_log.jsonl")
+    parser.add_argument(
+        "--conversation-log",
+        metavar="FILE",
+        default=None,
+        help="Write only the GM/Player dialogue to FILE (no MCP, routing, or internal logs).",
+    )
     parser.add_argument("--new", action="store_true", help="Start a fresh campaign.")
     parser.add_argument(
         "--manual-player",
@@ -227,6 +248,7 @@ def main():
     parser.add_argument("--temperature", type=float, default=0.7)
     parser.add_argument("--max-tokens", type=int, default=1800)
     parser.add_argument("--timeout", type=int, default=600)
+    parser.add_argument("--max-turns", type=int, default=0, help="Stop after this many self-play turns; 0 means unlimited.")
     parser.add_argument(
         "--mcp-command",
         default=f"{shlex.quote(sys.executable)} -m mythic_mcp.server",
@@ -362,10 +384,12 @@ def main():
                 return re.sub(r"\[FATE:.*?\]", "", gm_text, flags=re.I | re.S).strip()
 
             try:
+                print(f"[MCP] Calling {selection['name']}...", flush=True)
                 result = bridge.call(
                     selection["name"],
                     selection.get("arguments", {}),
                 )
+                print(f"[MCP] {selection['name']} completed.", flush=True)
 
                 log(
                     log_path,
@@ -435,75 +459,42 @@ def main():
             state["last_gm"] = gm_text
             state["scene_number"] = int(state.get("scene_number", 0)) + 1
 
-            print("\n=== GM ===\n" + gm_text)
+            print("\n=== GM ===\n" + gm_text, flush=True)
             log(log_path, {"role": "GM", "text": gm_text})
+            log_dialogue(args.conversation_log, "GM", gm_text, turn=0)
             save(state_path, state)
 
-        while True:
-            try:
-                user_input = input("\nYou (/quit, /save, /status): ").strip()
-            except (EOFError, KeyboardInterrupt):
-                print()
-                break
+        turn_count = 0
+        print("Autonomous self-play enabled. Press Ctrl+C to stop.")
 
-            if not user_input:
-                continue
+        while args.max_turns <= 0 or turn_count < args.max_turns:
+            turn_count += 1
 
-            command = user_input.lower()
+            player_prompt = (
+                "Continue the autonomous roleplaying session. Based on the GM's latest "
+                "narration, independently decide what your character does next. If the "
+                "character concept has not yet been settled, accept, refine, or reject "
+                "the proposal and then choose an action. Do not decide uncertain outcomes; "
+                "state only the character's intended action. Do not ask the human for input. "
+                "Keep the action appropriate to the character's goals, knowledge, and the "
+                "current situation.\n\nGM narration:\n"
+                + state.get("last_gm", "")
+            )
 
-            if command in {"/quit", "quit", "exit"}:
-                break
-
-            if command == "/save":
-                save(state_path, state)
-                print(f"Saved state to {state_path}")
-                continue
-
-            if command == "/status":
-                print(
-                    json.dumps(
-                        {
-                            "campaign": state.get("campaign", ""),
-                            "language": state.get("language", ""),
-                            "scene_number": state.get("scene_number", 0),
-                            "chaos_factor": state.get("chaos_factor", 5),
-                            "character": state.get("character", {}),
-                            "threads": state.get("threads", []),
-                            "npcs": state.get("npcs", []),
-                            "current_scene": state.get("current_scene", ""),
-                        },
-                        ensure_ascii=False,
-                        indent=2,
-                    )
-                )
-                continue
-
-            if args.manual_player:
-                player_action = user_input
-            else:
-                player_prompt = (
-                    "The GM's latest narration is below. Decide independently what your "
-                    "character does next. If this is the opening, decide whether to accept, "
-                    "refine, or reject the proposed character concept before choosing an "
-                    "action. Do not decide uncertain outcomes; state your intended action "
-                    "and let the GM adjudicate it.\n\nGM narration:\n"
-                    + state.get("last_gm", "")
-                    + "\n\nOptional user input or preference:\n"
-                    + user_input
-                )
-
-                player_action = call(client, "Player", player_history, player_prompt)
-
-                print("\n=== Player ===\n" + player_action)
-                log(log_path, {"role": "Player", "text": player_action})
+            player_action = call(client, "Player", player_history, player_prompt)
+            print(f"\n=== Player (turn {turn_count}) ===\n{player_action}", flush=True)
+            log(log_path, {"role": "Player", "turn": turn_count, "text": player_action})
+            log_dialogue(args.conversation_log, "Player", player_action, turn=turn_count)
 
             gm_prompt = (
-                "Continue the roleplaying session in the language already established. "
-                "Respond to the player's intended action, describe only what follows from "
-                "the fiction and authoritative Mythic MCP results, and leave the next "
-                "decision to the player. Do not invent a result for a mechanic that should "
-                "be resolved by Mythic MCP. If a Fate Question is needed, mark it exactly "
-                "as [FATE: question | odds] and pause that resolution for the MCP tool step.\n\n"
+                "Continue the autonomous roleplaying session in the language already "
+                "established. Respond to the player's intended action, describe what "
+                "follows from the fiction and authoritative Mythic MCP results, and then "
+                "leave a clear situation for the Player agent's next decision. Do not "
+                "invent a result for a mechanic that should be resolved by Mythic MCP. "
+                "If a Fate Question is needed, mark it exactly as [FATE: question | odds] "
+                "and do not decide its outcome. Never emit tool-call markup. Do not ask "
+                "the human for input; this is autonomous agent-vs-agent play.\n\n"
                 "Previous GM narration:\n"
                 + state.get("last_gm", "")
                 + "\n\nPlayer action:\n"
@@ -519,12 +510,16 @@ def main():
                 + state.get("last_gm", ""),
             )
 
-            print("\n=== GM ===\n" + gm_text)
-            log(log_path, {"role": "GM", "text": gm_text})
+            print(f"\n=== GM (turn {turn_count}) ===\n{gm_text}", flush=True)
+            log(log_path, {"role": "GM", "turn": turn_count, "text": gm_text})
+            log_dialogue(args.conversation_log, "GM", gm_text, turn=turn_count)
 
             state["last_gm"] = gm_text
             state["scene_number"] = int(state.get("scene_number", 0)) + 1
             save(state_path, state)
+
+        if args.max_turns > 0:
+            print(f"Reached --max-turns={args.max_turns}; stopping self-play.")
 
     finally:
         if bridge:
