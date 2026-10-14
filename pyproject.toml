@@ -1,0 +1,19 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "mythic-gm-mcp"
+version = "0.1.0"
+description = "MCP tools for running Mythic Game Master Emulator sessions"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+  "mcp>=1.2.0",
+]
+
+[project.scripts]
+mythic-gm-mcp = "mythic_mcp.server:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["mythic_mcp"]
