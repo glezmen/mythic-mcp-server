@@ -173,14 +173,45 @@ def mcp_tool_catalog(bridge):
     )
 
 
+def parse_tool_markup(text, known_tools):
+    """Parse tool-call markup emitted as plain text by models that do not use API tool calling."""
+    patterns = [
+        r"<tool_call>\s*(.*?)\s*</tool_call>",
+        r"<invoke>\s*(.*?)\s*</invoke>",
+    ]
+    for pattern in patterns:
+        for match in re.finditer(pattern, text, re.I | re.S):
+            raw = match.group(1).strip()
+            try:
+                data = json.loads(raw)
+            except json.JSONDecodeError:
+                continue
+
+            # Models use several incompatible plain-text formats.
+            name = data.get("name") or data.get("tool") or data.get("function")
+            arguments = data.get("arguments", data.get("parameters", {}))
+            if isinstance(name, dict):
+                arguments = name.get("arguments", arguments)
+                name = name.get("name")
+            if isinstance(arguments, str):
+                try:
+                    arguments = json.loads(arguments)
+                except json.JSONDecodeError:
+                    continue
+            if name in known_tools and isinstance(arguments, dict):
+                return {"call_tool": True, "name": name, "arguments": arguments,
+                        "purpose": "Parsed tool-call markup emitted by the model."}
+    return None
+
+
 def choose_tool_call(client, history, tools_text, action_text):
     """Ask the GM to select a valid MCP tool call when one is needed."""
     prompt = (
-        "Available Mythic MCP tools and their schemas:\n"
+        "Available Mythic MCP tools and their schemas:\\n"
         + tools_text
-        + "\n\nPlayer action or situation raised by the GM:\n"
+        + "\\n\\nPlayer action or situation raised by the GM:\\n"
         + action_text
-        + "\n\nDecide whether a Mythic MCP tool needs to be called NOW. "
+        + "\\n\\nDecide whether a Mythic MCP tool needs to be called NOW. "
         "If a tool call is needed, return ONLY valid JSON in this format: "
         '{"call_tool": true, "name": "exact_tool_name", '
         '"arguments": {...}, "purpose": "brief explanation"}. '
@@ -190,40 +221,38 @@ def choose_tool_call(client, history, tools_text, action_text):
     )
 
     raw = client.chat([
-        {
-            "role": "system",
-            "content": (
-                "You are a strict MCP tool selector. "
-                "Return valid JSON only, with no Markdown or additional text."
-            ),
-        },
-        {
-            "role": "user",
-            "content": prompt,
-        },
+        {"role": "system", "content": (
+            "You are a strict MCP tool selector. Return valid JSON only, "
+            "with no Markdown or additional text."
+        )},
+        {"role": "user", "content": prompt},
     ])
+
+    known = {tool["name"] for tool in getattr(client, "mcp_tools", [])}
+    parsed_markup = parse_tool_markup(raw, known)
+    if parsed_markup:
+        return parsed_markup
 
     match = re.search(r"\{.*\}", raw, re.S)
     if not match:
         return {"call_tool": False}
-
     try:
         data = json.loads(match.group())
-        known = {
-            tool["name"]
-            for tool in getattr(client, "mcp_tools", [])
-        }
-
-        if (
-            data.get("call_tool") is True
-            and data.get("name") in known
-            and isinstance(data.get("arguments"), dict)
-        ):
+        if (data.get("call_tool") is True and data.get("name") in known
+                and isinstance(data.get("arguments"), dict)):
             return data
     except (json.JSONDecodeError, TypeError, AttributeError):
         pass
-
     return {"call_tool": False}
+
+
+def strip_tool_markup(text):
+    """Remove tool-call/control markup so it is never shown as player-facing narration."""
+    text = re.sub(r"<tool_call>.*?</tool_call>", "", text, flags=re.I | re.S)
+    text = re.sub(r"<invoke>.*?</invoke>", "", text, flags=re.I | re.S)
+    text = re.sub(r"<function_results>.*?</function_results>", "", text, flags=re.I | re.S)
+    return text.strip()
+
 
 def main():
     parser = argparse.ArgumentParser(
@@ -338,109 +367,87 @@ def main():
         player_history = []
 
         def resolve_mcp_if_needed(gm_text, context):
-            """Use the MCP tool selector to resolve required game mechanics."""
+            """Execute model-emitted or selector-chosen MCP calls, then ask GM to narrate."""
             if not bridge:
-                return gm_text
+                return strip_tool_markup(gm_text)
 
+            known_tools = {tool["name"] for tool in bridge.tools}
+            original_text = gm_text
+            pending_text = gm_text
             fate_match = re.search(
                 r"\[FATE:\s*(.*?)\s*\|\s*(.*?)\s*\]",
-                gm_text,
-                re.I | re.S,
+                pending_text, re.I | re.S,
             )
 
-            if fate_match:
-                tool_context = (
-                    "Resolve this Fate Question through the Mythic MCP server. "
-                    "Question: "
-                    + fate_match.group(1).strip()
-                    + "; odds: "
-                    + fate_match.group(2).strip()
-                    + ". Select the appropriate available tool and schema-valid arguments."
-                )
-            else:
-                tool_context = (
-                    "Review the GM output and current turn to decide whether a Mythic "
-                    "MCP tool call is required now. Do not call a tool merely for narration.\n"
-                    "Turn context:\n"
-                    + context
-                    + "\nGM output:\n"
-                    + gm_text
-                )
-
-            selection = choose_tool_call(
-                client,
-                gm_history,
-                tools_text,
-                tool_context,
-            )
+            # Parse plain-text tool-call markup emitted by local models first.
+            selection = parse_tool_markup(pending_text, known_tools)
+            if not selection:
+                if fate_match:
+                    tool_context = (
+                        "Resolve this Fate Question through the Mythic MCP server. "
+                        "Question: " + fate_match.group(1).strip()
+                        + "; odds: " + fate_match.group(2).strip()
+                        + ". Select the appropriate available tool and schema-valid arguments."
+                    )
+                else:
+                    tool_context = (
+                        "Review the GM output and current turn to decide whether a Mythic "
+                        "MCP tool call is required now. Do not call a tool merely for narration.\n"
+                        "Turn context:\n" + context + "\nGM output:\n" + pending_text
+                    )
+                selection = choose_tool_call(client, gm_history, tools_text, tool_context)
 
             if not selection.get("call_tool"):
                 if fate_match:
                     print(
                         "No MCP tool was selected for the Fate Question; "
-                        "no local roll was substituted.",
-                        file=sys.stderr,
+                        "no local roll was substituted.", file=sys.stderr, flush=True,
                     )
-                return re.sub(r"\[FATE:.*?\]", "", gm_text, flags=re.I | re.S).strip()
+                return strip_tool_markup(re.sub(
+                    r"\[FATE:.*?\]", "", pending_text, flags=re.I | re.S
+                ))
 
-            try:
-                print(f"[MCP] Calling {selection['name']}...", flush=True)
-                result = bridge.call(
-                    selection["name"],
-                    selection.get("arguments", {}),
-                )
-                print(f"[MCP] {selection['name']} completed.", flush=True)
-
-                log(
-                    log_path,
-                    {
-                        "role": "MCP",
-                        "tool": selection["name"],
-                        "arguments": selection.get("arguments", {}),
-                        "purpose": selection.get("purpose", ""),
-                        "result": result,
-                    },
-                )
-
-                follow_up = (
-                    "An authoritative Mythic MCP tool has returned this result. "
-                    "Treat the result as authoritative; do not change or reroll it. "
-                    "Continue the scene in the language already used in the session.\n"
-                    + json.dumps(
-                        {
-                            "tool": selection["name"],
-                            "result": result,
-                        },
-                        ensure_ascii=False,
+            # A follow-up can emit another tool call. Limit chaining to avoid loops.
+            for _ in range(5):
+                try:
+                    name = selection["name"]
+                    arguments = selection.get("arguments", {})
+                    print(f"[MCP] Calling {name} with {json.dumps(arguments, ensure_ascii=False)}", flush=True)
+                    result = bridge.call(name, arguments)
+                    print(f"[MCP] {name} completed.", flush=True)
+                    log(log_path, {
+                        "role": "MCP", "tool": name, "arguments": arguments,
+                        "purpose": selection.get("purpose", ""), "result": result,
+                    })
+                    follow_up = (
+                        "An authoritative Mythic MCP tool has returned this result. "
+                        "Treat the result as authoritative; do not change or reroll it. "
+                        "Continue the scene in the language already used in the session. "
+                        "Write player-facing narration only. Do not output tool-call markup.\n"
+                        + json.dumps({"tool": name, "result": result}, ensure_ascii=False)
+                        + "\nOriginal GM output/context:\n" + original_text
+                        + "\nTurn context:\n" + context
                     )
-                    + "\nOriginal GM output:\n"
-                    + gm_text
-                )
-
-                updated = call(client, "GM", gm_history, follow_up)
-                return re.sub(
-                    r"\[FATE:.*?\]",
-                    "",
-                    updated,
-                    flags=re.I | re.S,
-                ).strip()
-
-            except Exception as exc:
-                log(
-                    log_path,
-                    {
-                        "role": "MCP_ERROR",
-                        "tool": selection.get("name"),
+                    updated = call(client, "GM", gm_history, follow_up)
+                    next_selection = parse_tool_markup(updated, known_tools)
+                    if next_selection:
+                        original_text = updated
+                        selection = next_selection
+                        continue
+                    return strip_tool_markup(re.sub(
+                        r"\[FATE:.*?\]", "", updated, flags=re.I | re.S
+                    ))
+                except Exception as exc:
+                    log(log_path, {
+                        "role": "MCP_ERROR", "tool": selection.get("name"),
                         "error": str(exc),
-                    },
-                )
-                print(f"MCP tool call failed: {exc}", file=sys.stderr)
-                return re.sub(
-                    r"\[FATE:.*?\]",
-                    "",
-                    gm_text,
-                    flags=re.I | re.S,
-                ).strip()
+                    })
+                    print(f"MCP tool call failed: {exc}", file=sys.stderr, flush=True)
+                    return strip_tool_markup(original_text)
+
+            print("[MCP] Stopped after 5 consecutive tool calls to prevent a loop.", file=sys.stderr, flush=True)
+            return strip_tool_markup(original_text)
+
 
         if not state.get("last_gm"):
             opening_prompt = (
