@@ -7,9 +7,9 @@ name = "mythic-gm-mcp"
 version = "0.1.0"
 description = "MCP tools for running Mythic Game Master Emulator sessions"
 readme = "README.md"
-requires-python = ">=3.10"
+requires-python = ">=3.11"
 dependencies = [
-  "mcp>=1.2.0",
+  "mcp>=2.0.0,<3.0.0",
 ]
 
 [project.scripts]

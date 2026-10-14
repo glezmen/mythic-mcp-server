@@ -3,11 +3,11 @@ from __future__ import annotations
 from datetime import datetime, timezone
 import random
 from typing import Any
-from mcp.server.fastmcp import FastMCP
+from mcp.server.mcpserver import MCPServer
 from .data import ODDS, YES_CHANCES, fate_thresholds, ACTION_MEANINGS, SUBJECT_MEANINGS, EVENT_FOCUS
 from .state import SessionState, next_id
 
-mcp = FastMCP("mythic-gm-emulator")
+mcp = MCPServer("mythic-gm-emulator")
 state = SessionState()
 
 def now():
