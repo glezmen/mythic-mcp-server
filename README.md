@@ -81,3 +81,20 @@ Uses MCP stdio transport, intended for an MCP client to launch as a local proces
 ## Important operational note
 
 Tools do not replace the LLM's judgment. The model chooses the Odds level, interprets the event words, narrates the fiction and asks the player what they do. It must use the tools to resolve randomness and maintain persistent state rather than silently inventing Fate results.
+
+## Usage
+
+Example prompts:
+
+You can be specific in the initial prompt:
+
+```text
+Start a new Mythic session, title is „The Forgotten Observatory”. Let Chaos Factor be 5. My character is a PI whi is investigating a forgotten observatory. Use the Mythic MCP tools to initialize the session, and then
+prepare the first scene.
+```
+
+Or You can give the model a chance to be creative:
+
+```text
+Start a Mythic game session, act as a Game Master. Create a world setup, my character, and come up with an original story what is not a copy of an already existing one.
+```
