@@ -33,7 +33,8 @@ def get_gm_instructions() -> dict[str, Any]:
         "Describe concrete sensory details and actionable choices. Do not reveal information the character cannot know. Keep the story moving; skip routine details.",
         "At the end of a scene, summarize what changed, update Threads/characters/facts, decide whether events were chaotic or under PC control, then call end_scene to update Chaos Factor and advance the scene.",
         "Use add_established_fact for consequential facts, add_thread/close_thread for goals, and add_character/update_character for recurring NPCs and groups. Record key developments in scene notes.",
-        "Do not secretly reroll or manipulate outcomes to favor the PC. If a question is badly framed, reformulate it before rolling. Use 'I don't know' only when a Random Event has no sensible interpretation after a brief attempt."
+        "Do not secretly reroll or manipulate outcomes to favor the PC. If a question is badly framed, reformulate it before rolling. Use 'I don't know' only when a Random Event has no sensible interpretation after a brief attempt.",
+        "Sequential Fate Questions: Never issue multiple Fate Question tool calls in parallel. Submit exactly one Fate Question, wait for its result, interpret the outcome, resolve any triggered Random Event, and only then decide whether another question is needed."
       ],
       "fate_question": {
         "odds_levels": ODDS,
