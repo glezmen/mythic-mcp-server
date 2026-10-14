@@ -118,6 +118,8 @@ class Client:
         self.max_tokens = max_tokens
         self.timeout = timeout
         self.reasoning = reasoning
+        # Remember a working reasoning-off spelling only for this process run.
+        self.reasoning_disable_value = None
 
     @staticmethod
     def _extract_text(content):
@@ -134,77 +136,243 @@ class Client:
         return ""
 
     def chat(self, messages):
-        # max_tokens is an output budget, not a target length. If the model
-        # exhausts it while reasoning, retry with a larger budget rather than
-        # silently treating the empty content field as a valid turn.
+        # Attempts 1-3 use the configured/default behavior. If all three hit the
+        # output limit without visible content, use attempts 4+ as recovery tries
+        # with reasoning disabled through LM Studio's native API. Probe both
+        # "none" and "off" because LM Studio/model versions differ in accepted
+        # values. Remember a working value only in this process, not on disk.
         last_detail = "No response received"
+        current_max_tokens = self.max_tokens
+        system_prompt = "\n\n".join(
+            str(m.get("content", "")) for m in messages if m.get("role") == "system"
+        )
+        conversation_messages = [m for m in messages if m.get("role") != "system"]
+
+        def make_native_input(items):
+            chunks = []
+            for item in items:
+                role = str(item.get("role", "user")).upper()
+                content = self._extract_text(item.get("content"))
+                if content:
+                    chunks.append(f"{role}:\n{content}")
+            return "\n\n".join(chunks)
+
+        # A successful spelling is remembered only in memory for this run.
+        cached_disable_value = self.reasoning_disable_value
+
+        # First three attempts: keep the normal behavior, including a command-line
+        # reasoning override. Only the recovery attempt explicitly disables it.
         for attempt in range(1, 4):
-            request_messages = list(messages)
-            attempt_max_tokens = self.max_tokens * (2 ** (attempt - 1))
+            request_messages = list(conversation_messages)
             if attempt > 1:
                 request_messages.append({
                     "role": "user",
                     "content": (
-                        "Your previous generation did not produce a visible answer. "
-                        "Now provide the requested final response directly in the normal "
-                        "assistant answer. Do not output a planning trace or an empty answer."
+                        "Your previous generation did not produce a visible final answer. "
+                        "Please provide the requested user-facing answer directly and concisely. "
+                        "Do not output a planning trace or internal analysis."
                     ),
                 })
                 print(
-                    f"[LM Studio] Retrying with max_tokens={attempt_max_tokens} "
+                    f"[LM Studio] Retrying with max_tokens={current_max_tokens} "
                     f"(attempt {attempt}/3).", flush=True,
                 )
 
-            request_payload = {
-                "model": self.model,
-                "messages": request_messages,
-                "temperature": self.temperature,
-                "max_tokens": attempt_max_tokens,
-                "stream": False,
-            }
-            # LM Studio's OpenAI-compatible endpoint supports reasoning_effort
-            # for compatible reasoning models. Pass the user-provided value as-is.
-            if self.reasoning is not None:
-                request_payload["reasoning_effort"] = self.reasoning
-
-            r = requests.post(
-                self.url + "/chat/completions",
-                json=request_payload,
-                timeout=self.timeout,
-            )
-            if not r.ok:
-                raise RuntimeError(f"LM Studio HTTP {r.status_code}: {r.text[:1500]}")
-            payload = r.json()
-            choices = payload.get("choices") or []
-            if choices:
-                choice = choices[0]
-                message = choice.get("message") or {}
-                text = self._extract_text(message.get("content"))
-                if text:
-                    return text
-                reasoning_text = self._extract_text(
-                    message.get("reasoning_content", message.get("reasoning"))
-                )
-                usage = payload.get("usage") or {}
-                last_detail = (
-                    f"empty content (finish_reason={choice.get('finish_reason')!r}, "
-                    f"reasoning_chars={len(reasoning_text)}, usage={json.dumps(usage, ensure_ascii=False)})"
-                )
-                print(
-                    f"[LM Studio] No visible content on attempt {attempt}/3: {last_detail}",
-                    file=sys.stderr, flush=True,
-                )
-                # Do not present internal reasoning as the GM/Player's final
-                # turn. Keep it available for diagnostics, and ask for a visible
-                # final answer with a larger output budget on the next attempt.
+            use_native_api = self.reasoning is not None
+            if use_native_api:
+                root_url = self.url[:-3] if self.url.endswith("/v1") else self.url.rstrip("/")
+                request_payload = {
+                    "model": self.model,
+                    "system_prompt": system_prompt,
+                    "input": make_native_input(request_messages),
+                    "temperature": self.temperature,
+                    "stream": False,
+                    "reasoning": (
+                        "off" if str(self.reasoning).lower() in ("none", "off", "false", "0")
+                        else str(self.reasoning).lower()
+                    ),
+                }
+                if current_max_tokens is not None:
+                    request_payload["max_output_tokens"] = current_max_tokens
+                endpoint = root_url + "/api/v1/chat"
             else:
-                last_detail = f"response has no choices: {json.dumps(payload, ensure_ascii=False)[:1200]}"
-                print(f"[LM Studio] Unusable response on attempt {attempt}/3: {last_detail}", file=sys.stderr, flush=True)
+                request_payload = {
+                    "model": self.model,
+                    "messages": [{"role": "system", "content": system_prompt}, *request_messages],
+                    "temperature": self.temperature,
+                    "stream": False,
+                }
+                if current_max_tokens is not None:
+                    request_payload["max_tokens"] = current_max_tokens
+                endpoint = self.url + "/chat/completions"
+
+            try:
+                r = requests.post(endpoint, json=request_payload, timeout=self.timeout)
+            except requests.RequestException as exc:
+                last_detail = f"request failed: {exc}"
+                print(f"[LM Studio] {last_detail}", file=sys.stderr, flush=True)
+                if attempt == 3:
+                    raise RuntimeError(f"LM Studio request failed after 3 attempts: {exc}") from exc
+                time.sleep(0.5)
+                continue
+
+            if not r.ok:
+                last_detail = f"HTTP {r.status_code}: {r.text[:1000]}"
+                print(f"[LM Studio] {last_detail}", file=sys.stderr, flush=True)
+                if attempt == 3:
+                    # Only enter reasoning-off recovery when the normal attempts
+                    # exhausted the generation budget, not for unrelated HTTP errors.
+                    raise RuntimeError(f"LM Studio HTTP error after 3 attempts: {last_detail}")
+                time.sleep(0.5)
+                continue
+
+            payload = r.json()
+            finish_reason = None
+            used = None
+            if use_native_api:
+                output_items = payload.get("output") or []
+                visible_parts = [
+                    self._extract_text(item.get("content"))
+                    for item in output_items
+                    if isinstance(item, dict) and item.get("type") == "message"
+                ]
+                text = "\n".join(part for part in visible_parts if part).strip()
+                reasoning_text = "\n".join(
+                    self._extract_text(item.get("content"))
+                    for item in output_items
+                    if isinstance(item, dict) and item.get("type") == "reasoning"
+                )
+                stats = payload.get("stats") or {}
+                used = stats.get("total_output_tokens")
+                last_detail = (
+                    f"empty visible message (reasoning_chars={len(reasoning_text)}, "
+                    f"stats={json.dumps(stats, ensure_ascii=False)})"
+                )
+                # Some native API versions include a stop reason in stats/response.
+                finish_reason = payload.get("finish_reason") or payload.get("stop_reason")
+            else:
+                choices = payload.get("choices") or []
+                if not choices:
+                    text = ""
+                    reasoning_text = ""
+                    usage = payload.get("usage") or {}
+                    used = usage.get("completion_tokens")
+                    last_detail = f"response has no choices: {json.dumps(payload, ensure_ascii=False)[:1200]}"
+                else:
+                    choice = choices[0]
+                    message = choice.get("message") or {}
+                    text = self._extract_text(message.get("content"))
+                    reasoning_text = self._extract_text(message.get("reasoning_content", message.get("reasoning")))
+                    usage = payload.get("usage") or {}
+                    used = usage.get("completion_tokens")
+                    finish_reason = choice.get("finish_reason")
+                    last_detail = (
+                        f"empty content (finish_reason={finish_reason!r}, "
+                        f"reasoning_chars={len(reasoning_text)}, usage={json.dumps(usage, ensure_ascii=False)})"
+                    )
+
+            if text:
+                return text
+
+            print(
+                f"[LM Studio] No visible content on attempt {attempt}/3: {last_detail}",
+                file=sys.stderr, flush=True,
+            )
+            hit_limit = (finish_reason == "length") or (
+                current_max_tokens is not None and isinstance(used, (int, float)) and used >= current_max_tokens
+            )
+            if hit_limit and current_max_tokens is not None and attempt < 3:
+                # Escalate between normal attempts only. Recovery keeps the
+                # same token cap that was used by normal attempt 3.
+                previous_limit = current_max_tokens
+                current_max_tokens *= 2
+                print(
+                    f"[LM Studio] Generation hit the token limit; increasing max_tokens "
+                    f"from {previous_limit} to {current_max_tokens}.", flush=True,
+                )
+            elif not hit_limit:
+                # Don't mask unrelated empty responses by switching APIs/reasoning.
+                if attempt == 3:
+                    raise RuntimeError(
+                        f"LM Studio returned no visible content after 3 attempts; "
+                        f"the output limit was not confirmed. Last details: {last_detail}"
+                    )
             time.sleep(0.5)
 
+        # Attempts 1-3 all exhausted their token budgets. Retry with reasoning
+        # disabled using the same token cap as attempt 3. Probe a value that worked
+        # earlier in this process first; otherwise try both accepted spellings.
+        root_url = self.url[:-3] if self.url.endswith("/v1") else self.url.rstrip("/")
+        disable_values = [cached_disable_value] if cached_disable_value else []
+        disable_values += [v for v in ("none", "off") if v not in disable_values]
+        recovery_messages = list(conversation_messages) + [{
+            "role": "user",
+            "content": (
+                "Your previous attempts exhausted the output-token limit without producing a visible answer. "
+                "Now give only the final user-facing response, directly and concisely."
+            ),
+        }]
+
+        for fallback_index, disable_value in enumerate(disable_values, start=4):
+            print(
+                f"[LM Studio] Recovery attempt {fallback_index}: explicitly disabling reasoning "
+                f"with reasoning={disable_value!r}, max_tokens={current_max_tokens}.",
+                flush=True,
+            )
+            request_payload = {
+                "model": self.model,
+                "system_prompt": system_prompt,
+                "input": make_native_input(recovery_messages),
+                "temperature": self.temperature,
+                "stream": False,
+                # Send the exact spelling being tested; do not normalize none -> off.
+                "reasoning": disable_value,
+            }
+            if current_max_tokens is not None:
+                request_payload["max_output_tokens"] = current_max_tokens
+            try:
+                r = requests.post(root_url + "/api/v1/chat", json=request_payload, timeout=self.timeout)
+            except requests.RequestException as exc:
+                last_detail = f"reasoning={disable_value!r} request failed: {exc}"
+                print(f"[LM Studio] {last_detail}", file=sys.stderr, flush=True)
+                continue
+
+            if not r.ok:
+                last_detail = f"reasoning={disable_value!r} HTTP {r.status_code}: {r.text[:1000]}"
+                print(f"[LM Studio] {last_detail}; trying next disable value if available.", file=sys.stderr, flush=True)
+                continue
+
+            payload = r.json()
+            output_items = payload.get("output") or []
+            visible_parts = [
+                self._extract_text(item.get("content"))
+                for item in output_items
+                if isinstance(item, dict) and item.get("type") == "message"
+            ]
+            text = "\n".join(part for part in visible_parts if part).strip()
+            reasoning_text = "\n".join(
+                self._extract_text(item.get("content"))
+                for item in output_items
+                if isinstance(item, dict) and item.get("type") == "reasoning"
+            )
+            if text:
+                self.reasoning_disable_value = disable_value
+                print(
+                    f"[LM Studio] Remembering reasoning-disable value {disable_value!r} for this run.",
+                    flush=True,
+                )
+                return text
+
+            stats = payload.get("stats") or {}
+            last_detail = (
+                f"reasoning={disable_value!r} returned no visible content "
+                f"(reasoning_chars={len(reasoning_text)}, stats={json.dumps(stats, ensure_ascii=False)})"
+            )
+            print(f"[LM Studio] {last_detail}; trying next disable value if available.", file=sys.stderr, flush=True)
+
         raise RuntimeError(
-            f"LM Studio did not return visible content after 3 attempts for model {self.model}. "
-            f"Last response details: {last_detail}"
+            f"LM Studio returned no visible content after 3 normal attempts and reasoning-off recovery "
+            f"attempts. Last details: {last_detail}"
         )
 
 def call(client, role, history, prompt):
@@ -415,8 +583,8 @@ def main():
         help="Enter player actions yourself instead of using the Player agent.",
     )
     parser.add_argument("--temperature", type=float, default=0.7)
-    parser.add_argument("--max-tokens", type=int, default=8192, help="Initial output token budget; if the model exhausts it without visible content, retries double the budget.")
-    parser.add_argument("--reasoning", default=None, help="Reasoning effort/value passed to LM Studio as reasoning_effort (for example: none, low, medium, high; other values are passed through).")
+    parser.add_argument("--max-tokens", type=int, default=8192, help="Starting output-token limit per request (default: 8192). If generation stops with finish_reason=length before visible content is returned, the script doubles this limit on each retry.")
+    parser.add_argument("--reasoning", default=None, help="Reasoning setting. When set, use LM Studio native /api/v1/chat (none/off maps to reasoning=off; on/low/medium/high pass through).")
     parser.add_argument("--timeout", type=int, default=600)
     parser.add_argument("--max-turns", type=int, default=0, help="Stop after this many self-play turns; 0 means unlimited.")
     parser.add_argument(
