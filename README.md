@@ -98,3 +98,35 @@ Or You can give the model a chance to be creative:
 ```text
 Start a Mythic game session, act as a Game Master. Create a world setup, my character, and come up with an original story what is not a copy of an already existing one.
 ```
+
+## Multi-Agent Mythic Game
+
+The repository includes `mythic_multi_agent.py`, a Python script that runs
+a Mythic game using two separate LLM agents:
+
+- **GM agent** — narrates the story and manages the game.
+- **Player agent** — controls the player character automatically, or lets
+  the user make decisions when manual mode is enabled.
+
+Both agents use the same LM Studio model, but maintain separate conversation
+histories. The script connects to the Mythic MCP server in this repository
+and discovers its available tools and argument schemas at runtime. Mythic
+mechanics and campaign state are handled through the MCP tools.
+
+### Requirements
+
+- Python 3.11 or newer
+- The repository's Mythic MCP server dependencies
+- LM Studio running with an OpenAI-compatible API server
+- The configured model loaded in LM Studio
+
+### Installation and usage
+
+Run the commands from the repository root, using the same virtual environment
+as the Mythic MCP server:
+
+```bash
+source .venv/bin/activate
+python -m pip install requests
+python mythic_multi_agent.py
+```
