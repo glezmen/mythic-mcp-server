@@ -3,11 +3,11 @@ from __future__ import annotations
 from datetime import datetime, timezone
 import random
 from typing import Any
-from mcp.server.mcpserver import MCPServer
+from mcp.server.fastmcp import FastMCP
 from .data import ODDS, YES_CHANCES, fate_thresholds, ACTION_MEANINGS, SUBJECT_MEANINGS, EVENT_FOCUS
 from .state import SessionState, next_id
 
-mcp = MCPServer("mythic-gm-emulator")
+mcp = FastMCP("mythic-gm-emulator")
 state = SessionState()
 
 def now():
@@ -33,8 +33,7 @@ def get_gm_instructions() -> dict[str, Any]:
         "Describe concrete sensory details and actionable choices. Do not reveal information the character cannot know. Keep the story moving; skip routine details.",
         "At the end of a scene, summarize what changed, update Threads/characters/facts, decide whether events were chaotic or under PC control, then call end_scene to update Chaos Factor and advance the scene.",
         "Use add_established_fact for consequential facts, add_thread/close_thread for goals, and add_character/update_character for recurring NPCs and groups. Record key developments in scene notes.",
-        "Do not secretly reroll or manipulate outcomes to favor the PC. If a question is badly framed, reformulate it before rolling. Use 'I don't know' only when a Random Event has no sensible interpretation after a brief attempt.",
-        "Sequential Fate Questions: Never issue multiple Fate Question tool calls in parallel. Submit exactly one Fate Question, wait for its result, interpret the outcome, resolve any triggered Random Event, and only then decide whether another question is needed."
+        "Do not secretly reroll or manipulate outcomes to favor the PC. If a question is badly framed, reformulate it before rolling. Use 'I don't know' only when a Random Event has no sensible interpretation after a brief attempt."
       ],
       "fate_question": {
         "odds_levels": ODDS,
@@ -431,10 +430,78 @@ def get_session_summary() -> dict[str, Any]:
 def mythic_gm_session() -> str:
     """Prompt template for an LLM acting as a Mythic GM Emulator."""
     return """You are running a player-led Mythic GM Emulator session. Use the MCP tools to maintain authoritative state.
-At session start, call get_gm_instructions and get_rules_reference, then start_session if no active session exists.
+At session start, call get_gm_instructions and get_rules_reference, then start_session if no active session exists. If creatively stuck, optionally call generate_story_idea, generate_meaning_pair, generate_npc_seed, or generate_scene_ideas; these are inspiration tools, not rules-triggered Random Events.
 Before a new scene, call get_next_scene_guidance and scene_check. For meaningful uncertainties, call fate_question with a clearly framed yes/no question and the current Chaos Factor. If its result triggers a Random Event, record the Fate answer first, then call generate_random_event and interpret it in context.
 At scene end, call end_scene with a concise summary and control='chaotic', 'controlled', or 'unchanged'; update facts, Threads, and Characters with tools.
 Narrate what the PC perceives, provide actionable choices, never decide the PC's actions or thoughts, do not reveal unknown information, and do not force a predetermined plot. Keep state consistent and avoid rolling for trivial facts."""
+
+
+@mcp.tool()
+def generate_meaning_pair(action_roll: int | None = None, subject_roll: int | None = None) -> dict[str, Any]:
+    """Generate a standalone Mythic Event Meaning pair without rolling Event Focus."""
+    from .data import ACTION_MEANINGS, SUBJECT_MEANINGS
+    if action_roll is not None and not 1 <= action_roll <= 100:
+        return {"error": "action_roll must be 1..100"}
+    if subject_roll is not None and not 1 <= subject_roll <= 100:
+        return {"error": "subject_roll must be 1..100"}
+    ar = action_roll if action_roll is not None else random.randint(1, 100)
+    sr = subject_roll if subject_roll is not None else random.randint(1, 100)
+    return {"action_roll": ar, "action": ACTION_MEANINGS[ar-1],
+            "subject_roll": sr, "subject": SUBJECT_MEANINGS[sr-1],
+            "instruction": "Use these words as prompts, not literal commands. Interpret them using the current scene and established facts."}
+
+@mcp.tool()
+def generate_story_idea(context: str = "", include_threads: bool = True,
+                        include_characters: bool = True, include_facts: bool = True) -> dict[str, Any]:
+    """Generate Mythic-style inspiration from meaning tables and current campaign state; not a rules-triggered Random Event."""
+    from .data import ACTION_MEANINGS, SUBJECT_MEANINGS
+    d = state.snapshot()
+    ar, sr = random.randint(1, 100), random.randint(1, 100)
+    threads = [t for t in d.get("threads", []) if t.get("status") == "open"] if include_threads else []
+    chars = [c for c in d.get("characters", []) if c.get("status", "active") == "active"] if include_characters else []
+    facts = d.get("established_facts", [])[-12:] if include_facts else []
+    return {
+      "type": "optional_inspiration_not_a_random_event",
+      "action_roll": ar, "action": ACTION_MEANINGS[ar-1],
+      "subject_roll": sr, "subject": SUBJECT_MEANINGS[sr-1],
+      "user_context": context, "scene": d.get("current_scene"),
+      "chaos_factor": d.get("chaos_factor"), "open_threads": threads,
+      "active_characters": chars, "established_facts": facts,
+      "instructions": [
+        "Suggest 2-3 distinct, concise interpretations of the Action + Subject pair that fit the supplied context.",
+        "Prefer ideas that emerge from established facts, open Threads, and active characters; do not contradict established facts.",
+        "Keep suggestions as possibilities, not predetermined outcomes. Do not decide the player character's actions or thoughts.",
+        "Do not change campaign state or record this as a Random Event.",
+        "If no interpretation fits naturally, say so and suggest ignoring this prompt (the Mythic 'I Dunno' principle)."
+      ]
+    }
+
+@mcp.tool()
+def generate_npc_seed(context: str = "", role: str = "", include_meaning: bool = True) -> dict[str, Any]:
+    """Provide a lightweight seed for an NPC/entity; the LLM should fill details consistent with the campaign."""
+    d = state.snapshot()
+    result: dict[str, Any] = {"context": context, "requested_role": role,
+      "existing_characters": [c for c in d.get("characters", []) if c.get("status", "active") == "active"],
+      "established_facts": d.get("established_facts", [])[-12:],
+      "instruction": "Propose a distinctive but context-fitting person or independently acting group. Include apparent role, immediate goal, visible tell, and one possible connection to an open Thread. These are suggestions; do not add the character to state until accepted."}
+    if include_meaning:
+      pair = generate_meaning_pair()
+      result["meaning_prompt"] = pair
+    return result
+
+@mcp.tool()
+def generate_scene_ideas(context: str = "", count: int = 3) -> dict[str, Any]:
+    """Return context for proposing possible next scenes without deciding which one occurs."""
+    if not 1 <= count <= 5:
+        return {"error": "count must be between 1 and 5"}
+    d = state.snapshot()
+    return {"context": context, "scene_number": d.get("scene_number"),
+      "current_scene": d.get("current_scene"), "chaos_factor": d.get("chaos_factor"),
+      "open_threads": [t for t in d.get("threads", []) if t.get("status") == "open"],
+      "active_characters": [c for c in d.get("characters", []) if c.get("status", "active") == "active"],
+      "established_facts": d.get("established_facts", [])[-15:],
+      "count": count,
+      "instructions": "Suggest the requested number of plausible scene setups. Each should state the opening situation and what makes it interesting, but not its outcome. Include at least one option that follows directly from PC intent. Do not roll scene_check here; use scene_check when the group has selected/proposed a setup. Do not force a Thread or alter state."}
 
 def main():
     mcp.run(transport="stdio")

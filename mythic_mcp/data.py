@@ -31,29 +31,32 @@ def fate_thresholds(yes_chance: int) -> tuple[int, int]:
 # These meaning tables are supplied as a convenience transcription from the
 # prior project draft. Check against the exact licensed Mythic edition if exact
 # wording/order is important; they were not present in assistant.zip's Java/XML.
+# Transcribed from Mythic Game Master Emulator, pp. 16-17. The printed
+# tables are arranged in five columns (1, 21, 41, 61, 81); these lists are
+# normalized to direct d100 indexing.
 ACTION_MEANINGS = [
-"Attainment","Starting","Neglect","Fighting","Recruit","Triumph","Violate","Oppose","Malice","Communicate",
-"Pursue","Increase","Decrease","Abandon","Gratify","Inquire","Antagonize","Move","Waste","Truce",
-"Release","Befriend","Judge","Desert","Control","Delay","Praise","Separate","Take","Break",
-"Heal","Delay","Stop","Lie","Return","Imitate","Struggle","Inform","Bestow","Postpone",
-"Reveal","Bargain","Imprison","Release","Celebrate","Develop","Travel","Block","Harm","Humiliate",
-"Extravagance","Postponement","Difficulty","Kill","Disrupt","Usurp","Create","Betray","Agree","Abuse",
-"Oppress","Inspect","Ambush","Spy","Attach/Connect","Carry/Transport","Open","Carelessness","Ruin","Extravagance",
-"Deceive/Trick","Arrive","Propose","Divide","Refuse","Distrust","Deceive","Cruelty","Impatience","Trust",
-"Excitement","Activity","Assist","Care","Negligence","Passion","Work hard","Control","Attract","Fail",
-"Pursue","Vengeance","Proceed/Process","Dispute","Punish","Guide","Transform","Overthrow","Oppress","Change",
+"Attainment","Starting","Neglect","Fight","Recruit","Triumph","Violate","Oppose","Malice","Communicate",
+"Persecute","Increase","Decrease","Abandon","Gratify","Inquire","Antagonise","Move","Waste","Truce",
+"Release","Befriend","Judge","Desert","Dominate","Procrastinate","Praise","Separate","Take","Break",
+"Heal","Delay","Stop","Lie","Return","Immitate","Struggle","Inform","Bestow","Postpone",
+"Expose","Haggle","Imprison","Release","Celebrate","Develop","Travel","Block","Harm","Debase",
+"Overindulge","Adjourn","Adversity","Kill","Disrupt","Usurp","Create","Betray","Agree","Abuse",
+"Oppress","Inspect","Ambush","Spy","Attach","Carry","Open","Carelessness","Ruin","Extravagance",
+"Trick","Arrive","Propose","Divide","Refuse","Mistrust","Deceive","Cruelty","Intolerance","Trust",
+"Excitement","Activity","Assist","Care","Negligence","Passion","Work hard","Control","Attract","Failure",
+"Pursue","Vengeance","Proceedings","Dispute","Punish","Guide","Transform","Overthrow","Oppress","Change",
 ]
 SUBJECT_MEANINGS = [
 "Goals","Dreams","Environment","Outside","Inside","Reality","Allies","Enemies","Evil","Good",
 "Emotions","Resistance","War","Peace","Innocence","Love","Spirituality","Intellect","New Ideas","Joy",
-"Messages","Energy","Balance","Tension","Friendship","Physical","Project","Pleasures","Pain","Possessions",
-"Benefits","Plans","Lies","Expectations","Legal Matters","Bureaucracy","Business","Path","News","Exterior Factors",
-"Advice","Plans/Conspiracy","Competition","Prison","Illness","Food","Attention","Success","Failure","Travel",
-"Jealousy","Argument","Home","Investment","Suffering","Wishes","Tactics","Stalemate","Randomness","Misfortune",
-"Death","Disruption","Power","Burden","Intrigues","Fears","Ambush","Rumor","Wounds","Luxury",
-"Representative","Adversities","Wealth","Freedom","Military","Mundane","Trials","Masses","Vehicle","Art",
+"Messages","Energy","Balance","Tension","Friendship","The physical","A project","Pleasures","Pain","Possessions",
+"Benefits","Plans","Lies","Expectations","Legal matters","Bureaucracy","Business","A path","News","Exterior factors",
+"Advice","A plot","Competition","Prison","Illness","Food","Attention","Success","Failure","Travel",
+"Jealousy","Dispute","Home","Investment","Suffering","Wishes","Tactics","Stalemate","Randomness","Misfortune",
+"Death","Disruption","Power","A burden","Intrigues","Fears","Ambush","Rumor","Wounds","Extravagance",
+"A representative","Adversities","Opulence","Liberty","Military","The mundane","Trials","Masses","Vehicle","Art",
 "Victory","Dispute","Riches","Status quo","Technology","Hope","Magic","Illusions","Portals","Danger",
-"Weapons","Animals","Weather","Elements","Nature","Public","Leadership","Fame","Anger","Information",
+"Weapons","Animals","Weather","Elements","Nature","The public","Leadership","Fame","Anger","Information",
 ]
 EVENT_FOCUS = [
     (1,7,"Remote Event"), (8,28,"NPC Action"), (29,35,"Introduce a New NPC"),
